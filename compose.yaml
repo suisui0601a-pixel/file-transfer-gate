@@ -7,24 +7,23 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     cpus: 0.25
-    mem_limit: 96m
+    mem_limit: 128m
     pids_limit: 64
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=8m
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./data:/srv:ro
+      - ./data:/srv:rw
       - ./state:/state:rw
     command:
       - serve
+      - --enable-admin
       - --bind
       - 0.0.0.0
       - --state
       - /state
       - --files
       - /srv
-      - --manifest
-      - /srv/current.json
       - --origin
       - ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to the public HTTPS origin}

@@ -1,6 +1,11 @@
 files.example.com {
-    request_body {
-        max_size 2KB
+    @upload path /admin/upload
+    @small not path /admin/upload
+    request_body @upload {
+        max_size 4294967296
+    }
+    request_body @small {
+        max_size 16384
     }
     header Strict-Transport-Security "max-age=31536000"
     header -Server

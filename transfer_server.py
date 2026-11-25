@@ -251,9 +251,15 @@ UPDATED = page('<h1>文件已更新</h1><p>请返回首页获取当前文件，�
 UNAVAILABLE = page("<h1>文件暂不可用</h1><p>请稍后重试或联系文件提供方。</p>")
 
 
-def create_server(bind, port, state, files, manifest, origin, *, legacy_session_cookie=None, legacy_csrf_cookie=None, legacy_downloads=None, trust_proxy=False):
-    store, catalog = Store(state), AssetCatalog(files, manifest)
-    catalog.load()  # Fail closed before listening if the initial file is invalid.
+def create_server(bind, port, state, files, manifest, origin, *, legacy_session_cookie=None, legacy_csrf_cookie=None, legacy_downloads=None, trust_proxy=False, extension=None):
+    if extension:
+        store, catalog = extension.store, extension.catalog
+    else:
+        from admin_service import control_enabled
+        if control_enabled(state):
+            raise ValueError("Administrator state requires --enable-admin; do not downgrade live state")
+        store, catalog = Store(state), AssetCatalog(files, manifest)
+        catalog.load()  # Fail closed before listening if the initial file is invalid.
     legacy_downloads = legacy_downloads or {}
     for name in (legacy_session_cookie, legacy_csrf_cookie):
         if name is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
@@ -284,6 +290,8 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
                 return {}
 
         def auth(self):
+            if extension and extension.can_download(self):
+                return True
             jar = self.cookies()
             self.migration_token = None
             if store.valid(jar.get(SESSION_COOKIE, "")):
@@ -294,7 +302,10 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
             return False
 
         def common_headers(self):
-            for key, value in [("Cache-Control", "private, no-store"), ("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"), ("Referrer-Policy", "same-origin"), ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")]:
+            csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+            if extension:
+                csp += "; script-src 'self'; connect-src 'self'"
+            for key, value in [("Cache-Control", "private, no-store"), ("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"), ("Referrer-Policy", getattr(self, "referrer_policy", "same-origin")), ("Content-Security-Policy", csp)]:
                 self.send_header(key, value)
             if self.migration_token:
                 self.send_header("Set-Cookie", SESSION_COOKIE + "=" + self.migration_token + "; Path=/; Secure; HttpOnly; SameSite=Strict")
@@ -303,7 +314,8 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
         def reply(self, status, body=b"", extra=()):
             self.send_response(status)
             self.common_headers()
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            if not any(key.lower() == "content-type" for key, _ in extra):
+                self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
             for key, value in extra:
@@ -317,6 +329,8 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
             self.close_connection = True
 
         def asset(self):
+            if extension:
+                return getattr(self, "selected_asset", None)
             try:
                 return catalog.load()
             except (OSError, ValueError, KeyError, TypeError):
@@ -326,7 +340,14 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
         def do_HEAD(self):
             self.do_GET()
 
+        def handle_expect_100(self):
+            if extension and self.path == "/admin/upload" and not extension.preflight_upload(self):
+                return False
+            return super().handle_expect_100()
+
         def do_GET(self):
+            if extension and extension.handle_get(self):
+                return
             if self.path == "/":
                 if self.auth():
                     asset = self.asset()
@@ -419,6 +440,8 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
                 print(json.dumps({"event": "transfer", "bytes_sent": sent, "expected_bytes": expected, "seconds": round(time.monotonic() - started, 3), "result": result}), flush=True)
 
         def do_POST(self):
+            if extension and extension.handle_post(self):
+                return
             if self.path != "/unlock":
                 self.reply(404)
                 return
@@ -488,7 +511,7 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
                 self.slots.release()
 
     server = Server((bind, port), Handler)
-    server.store, server.catalog = store, catalog
+    server.store, server.catalog, server.extension = store, catalog, extension
     return server
 
 
@@ -505,10 +528,15 @@ def main():
     reset.add_argument("--state", required=True)
     reset.add_argument("--operation-id", required=True)
     reset.add_argument("--revoke-sessions", action="store_true")
+    bootstrap = commands.add_parser("admin-bootstrap", help="Issue private first-activation token (24 hours); never publish it")
+    bootstrap.add_argument("--state", required=True)
     serve = commands.add_parser("serve", help="Serve only the configured file through an HTTPS reverse proxy")
     serve.add_argument("--state", required=True)
     serve.add_argument("--files", required=True)
-    serve.add_argument("--manifest", required=True)
+    serve.add_argument("--manifest")
+    serve.add_argument("--enable-admin", action="store_true")
+    serve.add_argument("--max-upload-bytes", type=int, default=4*1024**3)
+    serve.add_argument("--reserve-bytes", type=int, default=1024**3)
     serve.add_argument("--origin", required=True)
     serve.add_argument("--bind", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
@@ -524,8 +552,13 @@ def main():
     elif args.command == "prepare":
         print(json.dumps(prepare_manifest(args.file, args.manifest)))
     elif args.command == "reset":
-        changed = Store(args.state).reset(args.operation_id, revoke_sessions=args.revoke_sessions)
+        from admin_service import control_enabled, ControlStore
+        store = ControlStore(args.state) if control_enabled(args.state) else Store(args.state)
+        changed = store.reset(args.operation_id, revoke_sessions=args.revoke_sessions)
         print(json.dumps({"applied": changed, "already_applied": not changed}))
+    elif args.command == "admin-bootstrap":
+        from admin_service import ControlStore
+        print(json.dumps(ControlStore(args.state).new_bootstrap()))
     else:
         parsed = urllib.parse.urlsplit(args.origin)
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
@@ -539,8 +572,17 @@ def main():
                 legacy[path] = digest
             except ValueError:
                 parser.error("--legacy-download requires PATH=SHA256")
-        create_server(args.bind, args.port, args.state, args.files, args.manifest, args.origin.rstrip("/"), legacy_session_cookie=args.legacy_session_cookie, legacy_csrf_cookie=args.legacy_csrf_cookie, legacy_downloads=legacy, trust_proxy=args.trust_proxy).serve_forever()
+        if not args.enable_admin and not args.manifest:
+            parser.error("--manifest is required without --enable-admin")
+        if args.max_upload_bytes < 1 or args.reserve_bytes < 0:
+            parser.error("Invalid upload limits")
+        extension = None
+        if args.enable_admin:
+            from admin_service import AdminService
+            extension = AdminService(args.state, args.files, args.manifest, args.origin.rstrip("/"), max_upload=args.max_upload_bytes, reserve=args.reserve_bytes, legacy_session_cookie=args.legacy_session_cookie, legacy_csrf_cookie=args.legacy_csrf_cookie, legacy_downloads=legacy, trust_proxy=args.trust_proxy)
+        create_server(args.bind, args.port, args.state, args.files, args.manifest, args.origin.rstrip("/"), legacy_session_cookie=args.legacy_session_cookie, legacy_csrf_cookie=args.legacy_csrf_cookie, legacy_downloads=legacy, trust_proxy=args.trust_proxy, extension=extension).serve_forever()
 
 
 if __name__ == "__main__":
+    sys.modules.setdefault("transfer_server", sys.modules[__name__])
     main()
