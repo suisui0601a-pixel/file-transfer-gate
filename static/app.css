@@ -19,8 +19,11 @@
   box-sizing:border-box;
 }
 body {
+  display:flow-root;
+  min-height:100vh;
   margin:0;
   background:radial-gradient(ellipse at 90% 0%,var(--accent-soft),transparent 55%),var(--bg);
+  background-repeat:no-repeat;
   color:var(--ink);
   font:16px/1.65 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
 }
