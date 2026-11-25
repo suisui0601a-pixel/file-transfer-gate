@@ -2,6 +2,9 @@
 !Dockerfile
 !transfer_server.py
 !admin_service.py
+!ui.py
 !static/
 !static/admin.js
+!static/app.css
+!static/app.js
 !LICENSE

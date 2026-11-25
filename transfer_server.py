@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import ui
 
 LIMIT = 3
 SESSION_COOKIE = "transfer_session"
@@ -239,11 +240,8 @@ def prepare_manifest(file, manifest):
     return meta
 
 
-STYLE = """*{box-sizing:border-box}body{margin:0;background:#f6f7f9;color:#20242b;font:16px/1.7 system-ui,sans-serif}main{max-width:560px;margin:12vh auto;padding:32px;border:1px solid #e0e3e8;border-radius:14px;background:#fff}h1{font-size:26px;margin:0 0 18px}p{overflow-wrap:anywhere}input,button,a.button{font:inherit;border-radius:8px;padding:11px 16px}input{width:100%;border:1px solid #c9ced6;background:#fff;color:#20242b}button,a.button{display:inline-block;border:0;background:#303741;color:#fff;text-decoration:none;cursor:pointer}small{color:#606975;overflow-wrap:anywhere}a{color:#303741}@media(max-width:600px){main{margin:6vh 16px;padding:24px}}@media(prefers-color-scheme:dark){body{background:#17191d;color:#eceef1}main{background:#202329;border-color:#363b44}input{background:#17191d;color:#eceef1;border-color:#505865}button,a.button{background:#eceef1;color:#202329}a{color:#eceef1}small{color:#afb7c2}}"""
-
-
-def page(body):
-    return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件传输</title><style>' + STYLE + '</style><main>' + body + '</main></html>').encode()
+def page(body, *, layout='access', title='文件传输'):
+    return ui.document(body, layout=layout, title=title)
 
 
 EXHAUSTED = page("<h1>请联系管理员</h1><p>当前入口暂不可解锁，请联系文件提供方获取访问安排。</p>")
@@ -302,9 +300,7 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
             return False
 
         def common_headers(self):
-            csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-            if extension:
-                csp += "; script-src 'self'; connect-src 'self'"
+            csp = "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
             for key, value in [("Cache-Control", "private, no-store"), ("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"), ("Referrer-Policy", getattr(self, "referrer_policy", "same-origin")), ("Content-Security-Policy", csp)]:
                 self.send_header(key, value)
             if self.migration_token:
@@ -345,20 +341,28 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
                 return False
             return super().handle_expect_100()
 
+        def show_login(self, message='', status=200):
+            csrf = secrets.token_urlsafe(32)
+            self.reply(status, page(ui.login_body(csrf, message)), [("Set-Cookie", CSRF_COOKIE + "=" + csrf + "; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600")])
+
         def do_GET(self):
+            if self.path in ui.ASSETS:
+                name, content_type = ui.ASSETS[self.path]
+                self.reply(200, (ui.STATIC/name).read_bytes(), [("Content-Type", content_type)])
+                return
             if extension and extension.handle_get(self):
                 return
             if self.path == "/":
                 if self.auth():
                     asset = self.asset()
                     if asset is not None:
-                        self.reply(200, page('<h1>文件已就绪</h1><p>' + html.escape(asset.filename) + '</p><p><a class="button" href="' + asset.url + '">下载文件 · ' + format(asset.size / 2**30, '.2f') + ' GiB</a></p><p>支持断点续传。</p><small>SHA-256<br>' + asset.sha256 + '</small>'))
+                        body = '<div class="page-heading"><div class="hero-mark">'+ui.icon('check')+'</div><div><h1>文件已就绪</h1><p>选择文件，开始下一次交付。</p></div></div>'+ui.file_card(asset.filename,asset.size,asset.sha256,asset.url)
+                        self.reply(200, page(body,layout='download'))
                     return
                 if store.used() >= LIMIT:
                     self.reply(403, EXHAUSTED)
                     return
-                csrf = secrets.token_urlsafe(32)
-                self.reply(200, page('<h1>文件传输</h1><p>请输入访问密码。</p><form method="post" action="/unlock"><input type="hidden" name="csrf" value="' + csrf + '"><input type="password" name="password" autocomplete="current-password" required autofocus maxlength="128" aria-label="访问密码"><p><button type="submit">解锁</button></p></form>'), [("Set-Cookie", CSRF_COOKIE + "=" + csrf + "; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600")])
+                self.show_login()
                 return
             if not self.path.startswith("/download/") and self.path not in legacy_downloads:
                 self.reply(404)
@@ -477,9 +481,9 @@ def create_server(bind, port, state, files, manifest, origin, *, legacy_session_
             elif result == "exhausted":
                 self.reply(403, EXHAUSTED)
             elif result == "rate":
-                self.reply(429, page("<h1>请稍后重试</h1>"))
+                self.show_login('请稍后重试。',429)
             else:
-                self.reply(403, page('<h1>访问密码不正确</h1><p><a href="/">返回重试</a></p>'))
+                self.show_login('访问密码不正确，请重试。',403)
 
         def deny(self):
             self.reply(405, extra=[("Allow", "GET, HEAD, POST")])

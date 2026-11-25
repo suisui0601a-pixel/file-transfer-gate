@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.parse
 import transfer_server as base
+import ui
 
 DEFAULT_ADMIN_PASSWORD = "cosine123"
 ADMIN_COOKIE = "transfer_admin"
@@ -456,9 +457,8 @@ def link_for(row):
     return "/download/"+row["sha256"]+"/"+urllib.parse.quote(row["name"], safe="")
 
 
-def console_page(body):
-    style = base.STYLE + "main{max-width:960px;margin:5vh auto}section{padding:22px 0;border-top:1px solid #8884}label{display:block;margin:12px 0 5px}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.row input{width:160px}input[type=checkbox]{width:auto}button.danger{background:#9b3535;color:white}.file{padding:16px 0;border-top:1px solid #8883;overflow-wrap:anywhere}progress{width:100%}.muted{color:#7c8590}code{overflow-wrap:anywhere}h2{font-size:20px}"
-    return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文件管理</title><style>'+style+'</style><main>'+body+'</main><script src="/admin/app.js" defer></script></html>').encode()
+def console_page(body, *, initial=False):
+    return ui.document(body,title='文件管理',layout='access' if initial else 'admin',admin_script=True)
 
 
 class AdminService:
@@ -485,8 +485,22 @@ class AdminService:
 
     def login_form(self, handler, message="", status=200):
         csrf = secrets.token_urlsafe(32)
-        body = '<h1>文件传输</h1>'+message+'<form method="post" action="/unlock"><input type="hidden" name="csrf" value="'+csrf+'"><label for="password">请输入密码</label><input id="password" type="password" name="password" autocomplete="current-password" required maxlength="128"><p><button type="submit">进入</button></p></form>'
+        body = ui.login_body(csrf,message)
         handler.reply(status, base.page(body), [("Set-Cookie", cookie(base.CSRF_COOKIE, csrf, 600))])
+
+    def file_card(self, row, *, actions='', admin=False):
+        status = '删除待处理'
+        url, error = '', row.get('error','')
+        if row['status']=='published':
+            try:
+                asset = self.catalog.get(link_for(row))
+                if asset is None:
+                    raise ValueError('Published file unavailable')
+                status, url = '可下载', link_for(row)
+            except (OSError,ValueError,KeyError,TypeError):
+                status = '暂不可用'
+                error = '文件完整性检查未通过，请联系管理员。'
+        return ui.file_card(row['name'],row['size'],row['sha256'],url,actions=actions,status=status,error=error,admin=admin)
 
     def dashboard(self, handler, session):
         token = self.admin_token(handler)
@@ -496,34 +510,32 @@ class AdminService:
         initial = bool(session["needs_change"])
         password_fields = '<input type="hidden" name="role" value="admin">'
         if not initial:
-            password_fields += '<label>当前管理员密码</label><input type="password" name="current" autocomplete="current-password" required maxlength="128">'
-        password_fields += '<label>新管理员密码（至少 12 位）</label><input type="password" name="password" autocomplete="new-password" minlength="12" maxlength="128" required><label>再次输入</label><input type="password" name="confirm" autocomplete="new-password" minlength="12" maxlength="128" required><p><button>保存管理员密码</button></p>'
-        body = '<h1>'+('首次设置' if initial else '文件管理')+'</h1><p>'+('请先设置新的管理员密码，再使用管理功能。' if initial else '管理传输文件与访问权限。')+'</p>'
+            password_fields += '<label for="admin-current">当前管理员密码</label><input id="admin-current" type="password" name="current" autocomplete="current-password" required maxlength="128">'
+        password_fields += '<label for="admin-password">新管理员密码（至少 12 位）</label><input id="admin-password" type="password" name="password" autocomplete="new-password" minlength="12" maxlength="128" required><label for="admin-confirm">再次输入</label><input id="admin-confirm" type="password" name="confirm" autocomplete="new-password" minlength="12" maxlength="128" required><p><button type="submit">保存管理员密码</button></p>'
+        logout = form('/admin/logout','<button class="secondary small" type="submit">退出管理</button>')
         if initial:
-            body += form('/admin/password', password_fields)
+            body = '<div class="hero-mark">'+ui.icon('lock')+'</div><h1>首次设置</h1><p class="lede">设置新的管理员密码，再开始管理传输。</p>'+form('/admin/password',password_fields)+'<div class="switch-password">'+logout+'</div>'
         else:
             quota = self.store.quota()
-            body += '<section><h2>解锁额度</h2><p>剩余 <strong>'+str(quota["remaining"])+'</strong> 次 · 自上次重置已成功解锁 '+str(quota["used"])+' 次</p><p class="muted">访客页面不显示次数；现有会话刷新、下载与续传不重复计数。</p>'
+            body = '<header class="admin-header"><div class="admin-heading"><div class="hero-mark">'+ui.icon('gate')+'</div><div><h1>文件管理</h1><p>管理传输文件与访问权限。</p></div></div><div class="admin-tools"><span class="pill">管理员</span>'+logout+'</div></header>'
+            body += '<section class="panel quota-panel"><div class="quota-wrap"><div class="quota-number"><h2>剩余成功解锁次数</h2><div class="quota-value">'+str(quota['remaining'])+'<small>次</small></div><p class="muted">自上次重置已成功解锁 '+str(quota['used'])+' 次</p></div><div class="quota-controls">'
             for action, label, value in [('add','增加',1),('subtract','减少',1),('reset','重置为',quota['reset_value'])]:
-                body += form('/admin/quota','<div class="row"><input type="hidden" name="action" value="'+action+'"><input type="number" name="amount" min="'+('0' if action=='reset' else '1')+'" max="1000000" value="'+str(value)+'" aria-label="'+label+'次数" required><button>'+label+'</button></div>')
-            body += '</section><section><h2>访问密码</h2>'+form('/admin/password','<input type="hidden" name="role" value="access"><label>新访问密码</label><input type="password" name="password" autocomplete="new-password" maxlength="128" required><label>再次输入</label><input type="password" name="confirm" autocomplete="new-password" maxlength="128" required><label><input type="checkbox" name="revoke" value="yes"> 同时撤销已有访客会话</label><p><button>保存访问密码</button></p>')+'</section>'
-            body += '<section><h2>上传文件</h2><p>单文件最多 '+format(self.catalog.max_upload/2**30,'.2f')+' GiB；保留 '+format(self.catalog.reserve/2**30,'.2f')+' GiB 磁盘余量。完整上传后发布。</p><form id="upload-form" data-csrf="'+csrf_for(token)+'"><input type="file" id="upload-file" required aria-label="选择上传文件"><p><button id="upload-start">上传</button> <button id="upload-cancel" type="button" hidden>取消</button></p><progress id="upload-progress" value="0" max="100" hidden></progress><p id="upload-status" role="status"></p></form></section><section><h2>文件列表</h2>'
-            rows = self.catalog.rows(all_files=True)
-            active = [row for row in rows if row['status']!='deleted']
+                field_id='quota-'+action
+                body += form('/admin/quota','<input type="hidden" name="action" value="'+action+'"><label for="'+field_id+'">'+label+'次数</label><input id="'+field_id+'" type="number" name="amount" min="'+('0' if action=='reset' else '1')+'" max="1000000" value="'+str(value)+'" required><button class="'+('' if action=='reset' else 'secondary')+'" type="submit">'+label+'</button>')
+            body += '</div></div><p class="quota-note">次数仅管理员可见；现有会话刷新、下载与续传不重复计数。</p></section><div class="dashboard-grid">'
+            body += '<section class="panel"><h2>上传文件</h2><p>单文件最多 '+ui.format_size(self.catalog.max_upload)+'，预留 '+ui.format_size(self.catalog.reserve)+' 磁盘空间。完整上传后发布。</p><form id="upload-form" data-csrf="'+csrf_for(token)+'" data-max-bytes="'+str(self.catalog.max_upload)+'"><div class="file-picker"><input class="visually-hidden" type="file" id="upload-file" required aria-label="选择上传文件" aria-describedby="file-name"><label for="upload-file" class="button secondary">'+ui.icon('file')+'选择文件</label><span id="file-name" class="muted file-name-label" aria-live="polite">尚未选择文件</span></div><div class="file-actions"><button id="upload-start" type="submit">'+ui.icon('upload')+'上传</button><button id="upload-cancel" type="button" class="secondary" hidden>取消</button></div><progress id="upload-progress" value="0" max="100" aria-label="上传进度" hidden></progress><p id="upload-status" role="status" aria-live="polite"></p></form></section>'
+            access_fields = '<input type="hidden" name="role" value="access"><label for="access-password">新访问密码</label><input id="access-password" type="password" name="password" autocomplete="new-password" maxlength="128" required><label for="access-confirm">再次输入</label><input id="access-confirm" type="password" name="confirm" autocomplete="new-password" maxlength="128" required><label class="checkbox"><input type="checkbox" name="revoke" value="yes">同时撤销已有访客会话</label><p><button type="submit">保存访问密码</button></p>'
+            body += '<section class="panel"><h2>访问密码</h2><p>修改后用于新的访客解锁。</p>'+form('/admin/password',access_fields)+'</section></div><section class="panel file-list"><h2>传输文件</h2>'
+            active=[row for row in self.catalog.rows(all_files=True) if row['status']!='deleted']
             if not active:
-                body += '<p class="muted">暂无文件。</p>'
+                body += '<p class="empty-state">暂无文件。上传完成后会在这里显示。</p>'
             for row in active:
-                body += '<div class="file"><strong>'+html.escape(row['name'])+'</strong><p>'+format(row['size']/2**20,'.2f')+' MiB · '+('可下载' if row['status']=='published' else '删除待处理')+'</p><small>SHA-256 '+row['sha256']+'</small><p>'
-                if row['status']=='published':
-                    body += '<a href="'+link_for(row)+'">下载</a>'
-                if row['error']:
-                    body += html.escape(row['error'])
-                body += '</p>'+form('/admin/delete','<input type="hidden" name="id" value="'+row['id']+'"><input type="hidden" name="sha" value="'+row['sha256']+'"><button class="danger" data-confirm="确认删除此文件？删除后无法从网站恢复。">'+('删除文件' if row['status']=='published' else '重试删除')+'</button>')+'</div>'
+                deletion = form('/admin/delete','<input type="hidden" name="id" value="'+row['id']+'"><input type="hidden" name="sha" value="'+row['sha256']+'"><button type="submit" class="danger small" data-confirm="确认删除此文件？删除后无法从网站恢复。">'+ui.icon('trash')+('删除文件' if row['status']=='published' else '重试删除')+'</button>')
+                body += self.file_card(row,actions=deletion,admin=True)
             for row in self.catalog.interrupted():
-                body += '<div class="file"><strong>未完成上传：'+html.escape(row['name'])+'</strong><p>未向访客发布。</p>'+form('/admin/cleanup','<input type="hidden" name="id" value="'+row['id']+'"><button class="danger" data-confirm="确认清理此未完成上传？">清理残留</button>')+'</div>'
-            body += '</section><section><h2>管理员密码</h2>'+form('/admin/password',password_fields)+'</section>'
-        body += '<section>'+form('/admin/logout','<button>退出管理</button>')+'</section>'
-        handler.reply(200, console_page(body))
+                body += '<article class="file-card incomplete"><strong>未完成上传：'+html.escape(row['name'])+'</strong><p>未向访客发布。</p>'+form('/admin/cleanup','<input type="hidden" name="id" value="'+row['id']+'"><button class="danger small" type="submit" data-confirm="确认清理此未完成上传？">清理残留</button>')+'</article>'
+            body += '</section><section class="panel"><details class="password-settings"><summary>管理员密码</summary>'+form('/admin/password',password_fields)+'</details></section>'
+        handler.reply(200,console_page(body,initial=initial))
 
     def handle_get(self, handler):
         path = handler.path
@@ -560,17 +572,19 @@ class AdminService:
         if path == '/':
             if self.store.admin_session(self.admin_token(handler)):
                 handler.reply(303,extra=[('Location','/admin')])
+            elif self.store.claim_valid(handler.cookies().get(CLAIM_COOKIE,'')):
+                self.login_form(handler,'<p>正在进行管理员首次设置，请输入初始管理员密码。</p>')
             elif self.viewer_token(handler):
                 handler.auth()  # Migrate legacy viewer cookie without charging another unlock.
-                body = '<h1>文件已就绪</h1>'
+                body = '<div class="page-heading"><div class="hero-mark">'+ui.icon('check')+'</div><div><h1>文件已就绪</h1><p>选择文件，开始下一次交付。</p></div></div>'
                 rows = self.catalog.rows()
                 if not rows:
-                    body += '<p>暂无可下载文件，请联系管理员。</p>'
+                    body += '<p class="empty-state">暂无可下载文件，请联系管理员。</p>'
                 for row in rows:
-                    body += '<div><p>'+html.escape(row['name'])+'</p><a class="button" href="'+link_for(row)+'">下载 · '+format(row['size']/2**30,'.2f')+' GiB</a><p><small>SHA-256 '+row['sha256']+'</small></p></div>'
+                    body += self.file_card(row)
                 csrf = secrets.token_urlsafe(32)
-                body += '<p>支持断点续传。</p><details><summary>使用其他密码</summary><form method="post" action="/unlock"><input type="hidden" name="csrf" value="'+csrf+'"><input type="password" name="password" maxlength="128" autocomplete="current-password" required aria-label="密码"><p><button>进入</button></p></form></details>'
-                handler.reply(200,base.page(body),[('Set-Cookie',cookie(base.CSRF_COOKIE,csrf,600))])
+                body += '<details class="switch-password"><summary>使用其他密码</summary><form method="post" action="/unlock"><input type="hidden" name="csrf" value="'+csrf+'"><input type="password" name="password" maxlength="128" autocomplete="current-password" required aria-label="密码"><p><button>进入</button></p></form></details>'
+                handler.reply(200,base.page(body,layout='download'),[('Set-Cookie',cookie(base.CSRF_COOKIE,csrf,600))])
             else:
                 exhausted = self.store.quota()['remaining']==0
                 self.login_form(handler,'<p>当前入口暂不可解锁，请联系管理员。</p>' if exhausted else '<p>请输入访问密码。</p>')

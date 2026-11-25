@@ -11,12 +11,22 @@ if (form) {
   const cancel = document.getElementById("upload-cancel");
   const progress = document.getElementById("upload-progress");
   const status = document.getElementById("upload-status");
+  const fileName = document.getElementById("file-name");
+  picker.addEventListener("change", () => {
+    if (fileName) fileName.textContent = picker.files[0] ? picker.files[0].name : "尚未选择文件";
+  });
   let request = null;
   cancel.addEventListener("click", () => { if (request) request.abort(); });
   form.addEventListener("submit", event => {
     event.preventDefault();
     const file = picker.files[0];
     if (!file || request) return;
+    const limit = Number(form.dataset.maxBytes);
+    if (limit > 0 && file.size > limit) {
+      status.textContent = "文件超过上传大小限制，请选择更小的文件。";
+      status.classList.add("error-text");
+      return;
+    }
     const xhr = new XMLHttpRequest();
     request = xhr;
     xhr.open("POST", "/admin/upload");
@@ -29,14 +39,16 @@ if (form) {
     start.disabled = true;
     picker.disabled = true;
     status.textContent = "正在上传…";
+    status.classList.remove("error-text");
     xhr.upload.onprogress = event => {
       if (event.lengthComputable) {
         progress.value = event.loaded / event.total * 100;
         status.textContent = progress.value >= 100 ? "传输完成，正在校验并发布…" : "已上传 " + progress.value.toFixed(1) + "%";
       }
     };
-    const done = message => {
+    const done = (message, error = true) => {
       status.textContent = message;
+      status.classList.toggle("error-text", error);
       start.disabled = false;
       picker.disabled = false;
       cancel.hidden = true;
@@ -52,7 +64,7 @@ if (form) {
       }
     };
     xhr.onerror = () => done("连接中断，未完成的文件不会发布。请刷新后检查。");
-    xhr.onabort = () => done("已取消。未完成的文件不会发布。");
+    xhr.onabort = () => done("已取消。未完成的文件不会发布。", false);
     xhr.send(file);
   });
 }
