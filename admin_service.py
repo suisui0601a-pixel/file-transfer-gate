@@ -258,6 +258,7 @@ class ManagedCatalog:
         self.max_upload, self.reserve = max_upload, reserve
         self.lock, self.upload_slot = threading.RLock(), threading.Lock()
         self.cache = {}
+        self.blocked = set()
         with store.connect() as db:
             imported = db.execute("SELECT catalog_imported FROM control_meta WHERE id=1").fetchone()[0]
         if not imported:
@@ -266,10 +267,18 @@ class ManagedCatalog:
                 db.execute("BEGIN IMMEDIATE")
                 if not db.execute("SELECT catalog_imported FROM control_meta WHERE id=1").fetchone()[0]:
                     if asset:
-                        db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,'published',?,'')", (secrets.token_hex(16), asset.filename, asset.path.name, asset.size, asset.sha256, json.dumps(asset.identity), time.time()))
+                        file_id = secrets.token_hex(16)
+                        db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,'published',?,'')", (file_id, asset.filename, asset.path.name, asset.size, asset.sha256, json.dumps(asset.identity), time.time()))
+                        self.cache[file_id] = asset
                     db.execute("UPDATE control_meta SET catalog_imported=1 WHERE id=1")
         with store.connect() as db:
             db.execute("UPDATE uploads SET status='interrupted',error='进程在上传完成前退出' WHERE status='writing'")
+        # Verify once before listening, rather than hashing GiB files during an HTTP request.
+        for row in self.rows():
+            try:
+                self.get(link_for(row))
+            except (OSError,ValueError,KeyError,TypeError):
+                self.blocked.add(row['id'])
 
     @staticmethod
     def validate_name(name):
@@ -292,6 +301,8 @@ class ManagedCatalog:
                 expected = "/download/"+row["sha256"]+"/"+urllib.parse.quote(row["name"], safe="")
                 if url != expected:
                     continue
+                if row['id'] in self.blocked:
+                    raise ValueError('File verification failed at startup')
                 path = self.files/self.validate_storage(row["storage"])
                 with base.open_regular(path) as source:
                     info = os.fstat(source.fileno())
@@ -363,6 +374,7 @@ class ManagedCatalog:
                 file_id = duplicate["id"] if duplicate else secrets.token_hex(16)
                 if not duplicate:
                     db.execute("INSERT INTO files VALUES(?,?,?,?,?,?,'published',?,'')", (file_id, name, storage, size, sha, json.dumps(file_identity), time.time()))
+                    self.cache[file_id] = base.Asset(path,name,size,sha,file_identity)
                 db.execute("UPDATE uploads SET status=? WHERE id=?", ("duplicate" if duplicate else "complete", upload_id))
                 self.store.event(db, "file_uploaded", {"file_id": file_id, "bytes": size, "duplicate": bool(duplicate)})
             published = not bool(duplicate)
@@ -372,6 +384,12 @@ class ManagedCatalog:
                 db.execute("UPDATE uploads SET status='failed',error='上传未完成，未发布' WHERE id=? AND status='writing'", (upload_id,))
             raise
         finally:
+            if created and not published:
+                try:
+                    with self.store.connect() as db:
+                        published = bool(db.execute("SELECT 1 FROM files WHERE storage=?",(storage,)).fetchone())
+                except (OSError,sqlite3.Error):
+                    published = True  # Unknown commit outcome: preserve, never delete a possibly published file.
             if created and not published:
                 try:
                     info = path.lstat()

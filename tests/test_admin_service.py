@@ -1,4 +1,5 @@
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
 import http.client
 import io
@@ -250,6 +251,42 @@ class CatalogTests(Fixture,unittest.TestCase):
     def test_empty_upload(self):
         result = self.catalog.receive(io.BytesIO(b''),0,'empty.txt',self.token)
         self.assertEqual(result['sha256'],hashlib.sha256(b'').hexdigest())
+
+    def test_verified_import_and_upload_do_not_rehash_on_download(self):
+        with mock.patch.object(base,'hash_file',side_effect=AssertionError('HTTP must not rehash')):
+            self.assertIsNotNone(self.catalog.get(admin.link_for(self.catalog.rows()[0])))
+            meta = self.catalog.receive(io.BytesIO(b'new content'),11,'new.bin',self.token)
+            row = next(row for row in self.catalog.rows() if row['id']==meta['id'])
+            self.assertIsNotNone(self.catalog.get(admin.link_for(row)))
+
+    def test_restart_verifies_before_listening_and_corrupt_file_stays_blocked(self):
+        with mock.patch.object(base,'hash_file',wraps=base.hash_file) as hashing:
+            reopened = admin.ManagedCatalog(self.store,self.files,self.manifest,reserve=0)
+            self.assertEqual(hashing.call_count,1)
+        with mock.patch.object(base,'hash_file',side_effect=AssertionError('HTTP must not rehash')):
+            self.assertIsNotNone(reopened.get(admin.link_for(reopened.rows()[0])))
+        self.original.write_bytes(b'changed')
+        reopened = admin.ManagedCatalog(self.store,self.files,self.manifest,reserve=0)
+        with self.assertRaises(ValueError):
+            reopened.get(admin.link_for(reopened.rows()[0]))
+
+    def test_ambiguous_commit_does_not_delete_published_payload(self):
+        original_connect = self.store.connect
+        failed = False
+        @contextmanager
+        def uncertain_connect(**kwargs):
+            nonlocal failed
+            with original_connect(**kwargs) as db:
+                yield db
+                published = db.execute("SELECT 1 FROM files WHERE name='ambiguous.zip'").fetchone()
+            if published and not failed:
+                failed = True
+                raise admin.sqlite3.OperationalError('simulated lost commit acknowledgement')
+        with mock.patch.object(self.store,'connect',uncertain_connect):
+            with self.assertRaises(admin.sqlite3.OperationalError):
+                self.catalog.receive(io.BytesIO(b'preserve'),8,'ambiguous.zip',self.token)
+        row = next(row for row in self.catalog.rows() if row['name']=='ambiguous.zip')
+        self.assertEqual(self.catalog.get(admin.link_for(row)).path.read_bytes(),b'preserve')
 
     def test_upload_limits_and_names_before_create(self):
         before = set(self.files.iterdir())
